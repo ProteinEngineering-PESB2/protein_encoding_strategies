@@ -1,0 +1,11 @@
+*.egg-info
+.git
+.github
+.pytest_cache
+.venv*
+.tox
+__pycache__
+examples/
+notebooks/
+test-data/
+tests/

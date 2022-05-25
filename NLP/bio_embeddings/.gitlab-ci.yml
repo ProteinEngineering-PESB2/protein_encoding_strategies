@@ -1,0 +1,144 @@
+image: "python:3.7"
+
+#cache:
+#  key:
+#    files:
+#      - poetry.lock
+#    prefix: "${CI_JOB_NAME}"
+#  paths:
+#    - .venv
+
+stages:
+  - tests
+  - deploy
+
+.install-deps-template: &install-deps
+  before_script:
+    - pip install --upgrade pip virtualenv
+    - curl -sSL https://raw.githubusercontent.com/python-poetry/poetry/master/install-poetry.py | python - --version 1.1.8
+    - export PATH="/root/.local/bin:$PATH"
+    - poetry --version
+    # Force a recent pip version inside the virtualenv
+    - virtualenv .venv
+    - .venv/bin/pip install --upgrade pip
+    - poetry config virtualenvs.in-project true
+    - poetry install -E all -E webserver
+    # Install mmseqs2 SSE2 (the slowest version, for compatibility)
+    - wget https://mmseqs.com/latest/mmseqs-linux-sse2.tar.gz; tar xvfz mmseqs-linux-sse2.tar.gz; export PATH=$(pwd)/mmseqs/bin/:$PATH
+
+.test-template: &test
+  <<: *install-deps
+  variables:
+    SKIP_NEGLECTED_EMBEDDER_TESTS: 1
+    SKIP_AVX2_TESTS: 1
+  stage: tests
+  coverage: '/TOTAL.*\s(\d+\.\d+\%)/'
+  script: poetry run pytest -v
+
+python3.7:
+  <<: *test
+  image: python:3.7
+
+python3.9:
+  <<: *test
+  image: python:3.9
+
+# Those two are ran weekly to also run test the more expensive tests
+python3.7-scheduled:
+  <<: *install-deps
+  stage: tests
+  variables:
+    SKIP_AVX2_TESTS: 1
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+  image: python:3.7
+  script: poetry run pytest -v
+
+python3.9-scheduled:
+  <<: *install-deps
+  stage: tests
+  variables:
+    SKIP_AVX2_TESTS: 1
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+  image: python:3.9
+  script: poetry run pytest -v
+
+docs:
+  <<: *install-deps
+  stage: deploy
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+      when: always
+    - if: '$CI_COMMIT_TAG'
+      when: always
+  script:
+    - . .venv/bin/activate
+    - cd docs
+    - make html
+    # https://about.gitlab.com/blog/2017/11/02/automating-boring-git-operations-gitlab-ci/
+    - 'which ssh-agent || ( apt-get update -y && apt-get install openssh-client -y )'
+    - eval $(ssh-agent -s)
+    - ssh-add <(echo "$GIT_SSH_PRIV_KEY")
+    - git config --global user.name "bio_embeddings"
+    - git config --global user.email "support@bioembeddings.com"
+    # https://stackoverflow.com/a/29380765/3549270
+    - mkdir ~/.ssh
+    - ssh-keyscan -t rsa github.com >> ~/.ssh/known_hosts
+    - git clone git@github.com:sacdallago/bio_embeddings.git docs-branch
+    - cd docs-branch
+    - git checkout gh-pages
+    # We want to have separate documentation for every release while updating develop with every commit
+    # https://unix.stackexchange.com/a/412262/77322
+    - cp -r ../_build/html/. ${CI_COMMIT_TAG:-develop}
+    # Update the index page redirect to the latest tag
+    - if [ -n "$CI_COMMIT_TAG" ]; then echo "<meta http-equiv=refresh content=0;url='$CI_COMMIT_TAG/'>" > index.html; fi
+    # Update the "latest" redirect to the latest tag
+    - if [ -n "$CI_COMMIT_TAG" ]; then rm latest && ln -s $CI_COMMIT_TAG latest; fi
+    - git add .
+    - git commit --allow-empty -m 'Upload docs'
+    - git push
+
+.setup-kaniko-template: &setup-kaniko
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+      when: always
+    - if: '$CI_COMMIT_TAG'
+      when: always
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [ "" ]
+  before_script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"ghcr.io\":{\"username\":\"$CI_REGISTRY_USER\",\"password\":\"$CI_REGISTRY_PASSWORD\"}}}" > /kaniko/.docker/config.json
+
+docker-webserver-develop:
+  <<: *setup-kaniko
+  stage: deploy
+  script:
+    - /kaniko/executor --context $CI_PROJECT_DIR --dockerfile $CI_PROJECT_DIR/webserver/Dockerfile.webserver --destination ghcr.io/bioembeddings/webserver:${CI_COMMIT_TAG:-latest}
+
+docker-worker-develop:
+  <<: *setup-kaniko
+  stage: deploy
+  script:
+    - /kaniko/executor --context $CI_PROJECT_DIR --dockerfile $CI_PROJECT_DIR/webserver/Dockerfile.worker --destination ghcr.io/bioembeddings/worker:${CI_COMMIT_TAG:-latest}
+
+docker-bio_embeddings-develop:
+  <<: *setup-kaniko
+  stage: deploy
+  script:
+    - /kaniko/executor --context $CI_PROJECT_DIR --dockerfile $CI_PROJECT_DIR/Dockerfile --destination ghcr.io/bioembeddings/bio_embeddings:${CI_COMMIT_TAG:-latest}
+
+release-to-pypi:
+  stage: deploy
+  rules:
+    - if: '$CI_COMMIT_TAG'
+      when: always
+  image: python:3.8
+  script:
+    - pip install --upgrade pip virtualenv
+    - curl -sSL https://raw.githubusercontent.com/python-poetry/poetry/master/get-poetry.py | python
+    - source $HOME/.local/env
+    - poetry --version
+    - poetry publish --build -u __token__ -p $PYPI_TOKEN

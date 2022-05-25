@@ -128,4 +128,3 @@ def sequences2protvecsCSV(filename, seqs, kmersdict=threemersidx, embeddingweigh
     swissprotvecsdf = pd.DataFrame(formatprotvecs(swissprotvecs))
     swissprotvecsdf.to_csv(filename, index=False)
     return swissprotvecsdf
-
